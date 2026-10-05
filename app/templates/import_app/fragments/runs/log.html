@@ -5,9 +5,53 @@
 {% block title %}{% translate 'Logs for' %} #{{ run.id }}{% endblock %}
 
 {% block body %}
-<div class="card bg-base-100 shadow max-h-full overflow-auto">
-  <div class="card-body">
-    {{ run.logs|linebreaks }}
+<div class="grid grid-cols-1 gap-4 max-h-full overflow-auto">
+  {% if failed_rows %}
+  <div class="card bg-base-100 shadow">
+    <div class="card-header bg-base-200 p-3 text-sm">
+      <i class="fa-solid fa-triangle-exclamation text-warning me-2"></i>{% translate "Failed rows" %}
+    </div>
+    <div class="card-body p-0">
+      <table class="table table-sm table-zebra">
+        <thead>
+          <tr>
+            <th>{% translate "Section" %}</th>
+            <th>{% translate "Row" %}</th>
+            <th>{% translate "Status" %}</th>
+            <th>{% translate "Stage" %}</th>
+            <th>{% translate "Code" %}</th>
+            <th>{% translate "Message" %}</th>
+            <th>{% translate "Attempts" %}</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in failed_rows %}
+          <tr>
+            <td class="whitespace-nowrap">{{ row.section }}</td>
+            <td>{{ row.row_number }}</td>
+            <td class="whitespace-nowrap">
+              {% if row.status == 'FAILED_RETRYABLE' %}
+                <span class="text-warning">{% translate "retryable" %}</span>
+              {% else %}
+                <span class="text-error">{% translate "permanent" %}</span>
+              {% endif %}
+            </td>
+            <td>{{ row.failure_reason.stage|default_if_none:"" }}</td>
+            <td class="whitespace-nowrap">{{ row.failure_reason.code|default_if_none:"" }}</td>
+            <td>{{ row.failure_reason.message|default_if_none:"" }}</td>
+            <td>{{ row.attempts }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      {{ run.logs|linebreaks }}
+    </div>
   </div>
 </div>
 {% endblock %}

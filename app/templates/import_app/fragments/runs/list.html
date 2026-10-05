@@ -15,8 +15,9 @@
     {% for run in runs %}
       <div class="col">
         <div class="card bg-base-100 shadow">
-          <div class="card-header bg-base-200 p-4 text-sm {% if run.status == run.Status.QUEUED %}text-base-content{% elif run.status == run.Status.PROCESSING %}text-warning{% elif run.status == run.Status.FINISHED %}text-success{% else %}text-error{% endif %}">
-            <span><i class="fa-solid {% if run.status == run.Status.QUEUED %}fa-hourglass-half{% elif run.status == run.Status.PROCESSING %}fa-spinner{% elif run.status == run.Status.FINISHED %}fa-check{% else %}fa-xmark{% endif %} fa-fw me-2"></i>{{ run.get_status_display }}</span>
+          <div class="card-header bg-base-200 p-4 text-sm {% if run.status == run.Status.QUEUED %}text-base-content{% elif run.status == run.Status.PROCESSING %}{% if run.is_retriable %}text-error{% else %}text-warning{% endif %}{% elif run.status == run.Status.FINISHED %}text-success{% else %}text-error{% endif %}">
+            <span><i class="fa-solid {% if run.status == run.Status.QUEUED %}fa-hourglass-half{% elif run.status == run.Status.PROCESSING %}{% if run.is_retriable %}fa-triangle-exclamation{% else %}fa-spinner{% endif %}{% elif run.status == run.Status.FINISHED %}fa-check{% else %}fa-xmark{% endif %} fa-fw me-2"></i>{{ run.get_status_display }}{% if run.status == run.Status.PROCESSING and run.is_retriable %} <span class="text-xs">({% translate "lease expired" %})</span>{% endif %}</span>
+            <span class="text-xs text-base-content/60 float-end">{{ run.get_mode_display }} · {{ run.get_phase_display }}</span>
           </div>
           <div class="card-body">
             <h5 class="card-title"><i class="fa-solid fa-hashtag me-1 text-xs text-gray-400"></i>{{ run.id }}<span class="text-xs text-gray-400 ms-1">({{ run.file_name }})</span></h5>
@@ -67,7 +68,7 @@
                     <div class="text-base-content/70 text-xs font-medium">
                       {% trans 'Failed Items' %}
                     </div>
-                    <div class="text-sm">
+                    <div class="text-sm {% if run.failed_rows %}text-error{% endif %}">
                       {{ run.failed_rows }}
                     </div>
                   </div>
@@ -87,6 +88,19 @@
                 </div>
               </div>
 
+              <div class="col">
+                <div class="flex flex-row">
+                  <div class="flex flex-col">
+                    <div class="text-base-content/70 text-xs font-medium">
+                      {% trans 'Retryable Items' %}
+                    </div>
+                    <div class="text-sm {% if run.retryable_rows %}text-warning{% endif %}">
+                      {{ run.retryable_rows }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
             </div>
           </div>
           <div class="card-footer bg-base-200 p-4 text-base-content/70">
@@ -95,6 +109,13 @@
                data-tippy-content="{% translate "Logs" %}"
                hx-get="{% url 'import_run_log' profile_id=profile.id run_id=run.id %}"
                hx-target="#generic-offcanvas"><i class="fa-solid fa-file-lines"></i></a>
+            {% if run.is_retriable %}
+            <a class="no-underline text-warning ms-2"
+               role="button"
+               data-tippy-content="{% translate "Retry" %}"
+               hx-post="{% url 'import_run_retry' profile_id=profile.id run_id=run.id %}"
+               hx-confirm="{% translate "Retry this import run?" %}"><i class="fa-solid fa-rotate-right fa-fw"></i></a>
+            {% endif %}
             <a class="no-underline text-error"
                role="button"
                data-tippy-content="{% translate "Delete" %}"

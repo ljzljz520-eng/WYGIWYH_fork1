@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PACKAGE VERSION\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-03 17:07+0000\n"
+"POT-Creation-Date: 2026-10-05 04:15+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -93,7 +93,7 @@ msgid "Tags"
 msgstr ""
 
 #: apps/accounts/models.py:12 apps/accounts/models.py:29 apps/dca/models.py:13
-#: apps/import_app/models.py:14 apps/rules/models.py:13
+#: apps/import_app/models.py:15 apps/rules/models.py:13
 #: apps/transactions/models.py:238 apps/transactions/models.py:263
 #: apps/transactions/models.py:287 apps/transactions/models.py:1078
 #: apps/users/models.py:572 templates/account_groups/fragments/list.html:22
@@ -928,68 +928,203 @@ msgstr ""
 msgid "Import"
 msgstr ""
 
-#: apps/import_app/models.py:15
+#: apps/import_app/models.py:16
 msgid "YAML Configuration"
 msgstr ""
 
-#: apps/import_app/models.py:19
+#: apps/import_app/models.py:20
 #: templates/import_app/fragments/profiles/list.html:35
 msgid "Version"
 msgstr ""
 
-#: apps/import_app/models.py:30
+#: apps/import_app/models.py:31
 #, python-brace-format
 msgid "Version {number}"
 msgstr ""
 
-#: apps/import_app/models.py:39
+#: apps/import_app/models.py:40
 msgid "Invalid YAML Configuration: "
 msgstr ""
 
-#: apps/import_app/models.py:45
+#: apps/import_app/models.py:46
 msgid "Queued"
 msgstr ""
 
-#: apps/import_app/models.py:46
+#: apps/import_app/models.py:47
 msgid "Processing"
 msgstr ""
 
-#: apps/import_app/models.py:47
+#: apps/import_app/models.py:48 apps/import_app/models.py:60
 msgid "Failed"
 msgstr ""
 
-#: apps/import_app/models.py:48
+#: apps/import_app/models.py:49 apps/import_app/models.py:59
 #: templates/installment_plans/fragments/list.html:19
 #: templates/recurring_transactions/fragments/list.html:20
 msgid "Finished"
 msgstr ""
 
-#: apps/import_app/models.py:54
+#: apps/import_app/models.py:52
+msgid "Strict"
+msgstr ""
+
+#: apps/import_app/models.py:53
+msgid "Fault tolerant"
+msgstr ""
+
+#: apps/import_app/models.py:56
+msgid "Enqueued"
+msgstr ""
+
+#: apps/import_app/models.py:57
+msgid "Parsing"
+msgstr ""
+
+#: apps/import_app/models.py:58
+msgid "Committing"
+msgstr ""
+
+#: apps/import_app/models.py:68 apps/import_app/models.py:265
+#: templates/import_app/fragments/runs/log.html:20
 msgid "Status"
 msgstr ""
 
-#: apps/import_app/models.py:62
+#: apps/import_app/models.py:74
+msgid "Mode"
+msgstr ""
+
+#: apps/import_app/models.py:80
+msgid "Phase"
+msgstr ""
+
+#: apps/import_app/models.py:92
+msgid "User who enqueued the run; used for recovered retries"
+msgstr ""
+
+#: apps/import_app/models.py:96
 msgid "File name"
 msgstr ""
 
-#: apps/import_app/views.py:67
+#: apps/import_app/models.py:105
+msgid "SHA-256 hash of the source file content"
+msgstr ""
+
+#: apps/import_app/models.py:110
+msgid "Source file size in bytes"
+msgstr ""
+
+#: apps/import_app/models.py:116
+msgid "Absolute path of the staged source file (server side)"
+msgstr ""
+
+#: apps/import_app/models.py:121
+msgid "Summary of the parsed source (sections, row counts, ...)"
+msgstr ""
+
+#: apps/import_app/models.py:128
+msgid "YAML configuration snapshot taken at enqueue time"
+msgstr ""
+
+#: apps/import_app/models.py:133
+msgid "Persistent resume cursor"
+msgstr ""
+
+#: apps/import_app/models.py:141
+msgid "Identifier of the worker owning the current lease"
+msgstr ""
+
+#: apps/import_app/models.py:146
+msgid "Time at which the current lease expires"
+msgstr ""
+
+#: apps/import_app/models.py:150
+msgid "How many times the processing task was (re)started"
+msgstr ""
+
+#: apps/import_app/models.py:217
+msgid "Pending"
+msgstr ""
+
+#: apps/import_app/models.py:218
+msgid "Staged"
+msgstr ""
+
+#: apps/import_app/models.py:219
+msgid "Committed"
+msgstr ""
+
+#: apps/import_app/models.py:220
+msgid "Skipped"
+msgstr ""
+
+#: apps/import_app/models.py:221
+msgid "Failed (retryable)"
+msgstr ""
+
+#: apps/import_app/models.py:222
+msgid "Failed (permanent)"
+msgstr ""
+
+#: apps/import_app/models.py:236
+msgid "Global ordering of the row within the run"
+msgstr ""
+
+#: apps/import_app/models.py:242
+msgid "Source section (file name, sheet name, zip member)"
+msgstr ""
+
+#: apps/import_app/models.py:245
+msgid "Row number inside the source section"
+msgstr ""
+
+#: apps/import_app/models.py:250
+msgid "Stable key derived from the source file and row"
+msgstr ""
+
+#: apps/import_app/models.py:254
+msgid "Raw values extracted from the source file"
+msgstr ""
+
+#: apps/import_app/models.py:259
+msgid "Mapped, JSON-serializable values ready to be committed"
+msgstr ""
+
+#: apps/import_app/models.py:271
+msgid "Structured failure reason: {stage, code, message, line, exception}"
+msgstr ""
+
+#: apps/import_app/models.py:281
+msgid "Transaction produced when this row was committed"
+msgstr ""
+
+#: apps/import_app/views.py:64
 msgid "Import Profile added successfully"
 msgstr ""
 
-#: apps/import_app/views.py:103
+#: apps/import_app/views.py:100
 msgid "Import Profile update successfully"
 msgstr ""
 
-#: apps/import_app/views.py:130
+#: apps/import_app/views.py:127
 msgid "Import Profile deleted successfully"
 msgstr ""
 
-#: apps/import_app/views.py:195
+#: apps/import_app/views.py:204
 msgid "Import Run queued successfully"
 msgstr ""
 
-#: apps/import_app/views.py:222
+#: apps/import_app/views.py:209
+msgid ""
+"An identical file is already queued or being processed for this import "
+"profile."
+msgstr ""
+
+#: apps/import_app/views.py:240
 msgid "Run deleted successfully"
+msgstr ""
+
+#: apps/import_app/views.py:281
+msgid "Import Run queued for retry"
 msgstr ""
 
 #: apps/insights/forms.py:118 apps/insights/utils/sankey.py:36
@@ -1076,6 +1211,11 @@ msgstr ""
 
 #: apps/insights/views.py:60 templates/entities/fragments/table.html:69
 msgid "No entities"
+msgstr ""
+
+#: apps/net_worth/views.py:137 templates/net_worth/net_worth.html:84
+#: templates/net_worth/net_worth.html:85
+msgid "Consolidated"
 msgstr ""
 
 #: apps/rules/forms.py:27
@@ -2202,7 +2342,7 @@ msgstr ""
 #: templates/exchange_rates_services/fragments/list.html:47
 #: templates/exchange_rates_services/fragments/table.html:30
 #: templates/import_app/fragments/profiles/list.html:63
-#: templates/import_app/fragments/runs/list.html:100
+#: templates/import_app/fragments/runs/list.html:121
 #: templates/installment_plans/fragments/table.html:54
 #: templates/mini_tools/unit_price_calculator.html:16
 #: templates/quick_transactions/fragments/list.html:32
@@ -2233,7 +2373,7 @@ msgstr ""
 #: templates/exchange_rates_services/fragments/list.html:51
 #: templates/exchange_rates_services/fragments/table.html:35
 #: templates/import_app/fragments/profiles/list.html:67
-#: templates/import_app/fragments/runs/list.html:104
+#: templates/import_app/fragments/runs/list.html:125
 #: templates/installment_plans/fragments/table.html:47
 #: templates/installment_plans/fragments/table.html:58
 #: templates/quick_transactions/fragments/list.html:37
@@ -2283,7 +2423,7 @@ msgstr ""
 #: templates/exchange_rates_services/fragments/list.html:53
 #: templates/exchange_rates_services/fragments/table.html:37
 #: templates/import_app/fragments/profiles/list.html:69
-#: templates/import_app/fragments/runs/list.html:106
+#: templates/import_app/fragments/runs/list.html:127
 #: templates/installment_plans/fragments/table.html:60
 #: templates/quick_transactions/fragments/list.html:39
 #: templates/recurring_transactions/fragments/table.html:94
@@ -2603,6 +2743,7 @@ msgid "Edit currency"
 msgstr ""
 
 #: templates/currencies/fragments/list.html:22
+#: templates/import_app/fragments/runs/log.html:22
 msgid "Code"
 msgstr ""
 
@@ -2856,41 +2997,89 @@ msgstr ""
 msgid "Runs for"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:29
+#: templates/import_app/fragments/runs/list.html:19
+msgid "lease expired"
+msgstr ""
+
+#: templates/import_app/fragments/runs/list.html:30
 msgid "Total Items"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:42
+#: templates/import_app/fragments/runs/list.html:43
 msgid "Processed Items"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:55
+#: templates/import_app/fragments/runs/list.html:56
 msgid "Skipped Items"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:68
+#: templates/import_app/fragments/runs/list.html:69
 msgid "Failed Items"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:81
+#: templates/import_app/fragments/runs/list.html:82
 msgid "Successful Items"
 msgstr ""
 
 #: templates/import_app/fragments/runs/list.html:95
+msgid "Retryable Items"
+msgstr ""
+
+#: templates/import_app/fragments/runs/list.html:109
 #: templates/rules/fragments/transaction_rule/dry_run/visual.html:7
 msgid "Logs"
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:105
+#: templates/import_app/fragments/runs/list.html:115
+msgid "Retry"
+msgstr ""
+
+#: templates/import_app/fragments/runs/list.html:117
+msgid "Retry this import run?"
+msgstr ""
+
+#: templates/import_app/fragments/runs/list.html:126
 msgid "You won't be able to revert this! All imported items will be kept."
 msgstr ""
 
-#: templates/import_app/fragments/runs/list.html:114
+#: templates/import_app/fragments/runs/list.html:135
 msgid "No runs yet"
 msgstr ""
 
 #: templates/import_app/fragments/runs/log.html:5
 msgid "Logs for"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:12
+msgid "Failed rows"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:18
+msgid "Section"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:19
+msgid "Row"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:21
+msgid "Stage"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:23
+msgid "Message"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:24
+msgid "Attempts"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:34
+msgid "retryable"
+msgstr ""
+
+#: templates/import_app/fragments/runs/log.html:36
+msgid "permanent"
 msgstr ""
 
 #: templates/includes/mobile_navbar.html:12
@@ -3379,10 +3568,6 @@ msgstr ""
 #: templates/net_worth/net_worth.html:52
 #: templates/yearly_overview/pages/overview_by_currency.html:6
 msgid "By currency"
-msgstr ""
-
-#: templates/net_worth/net_worth.html:84 templates/net_worth/net_worth.html:85
-msgid "Consolidated"
 msgstr ""
 
 #: templates/net_worth/net_worth.html:135

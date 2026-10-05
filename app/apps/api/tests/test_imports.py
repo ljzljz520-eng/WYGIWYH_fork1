@@ -90,6 +90,42 @@ column_mapping:
             user_id=self.user.id,
         )
 
+    @patch("apps.import_app.tasks.process_import.defer")
+    def test_duplicate_active_file_returns_409(self, mock_defer):
+        """Re-uploading the same content while a run is active returns 409."""
+        import tempfile
+        from apps.import_app.services import enqueue as enqueue_service
+
+        csv_content = b"date,description,amount,account\n2025-01-01,Test,100,Main"
+        tmpdir = tempfile.mkdtemp(prefix="wygiwyh-api-enqueue-")
+        self.addCleanup(__import__("shutil").rmtree, tmpdir, True)
+
+        with patch.object(enqueue_service, "DEFAULT_TEMP_DIR", tmpdir):
+            file1 = SimpleUploadedFile(
+                "dup.csv", csv_content, content_type="text/csv"
+            )
+            response1 = self.client.post(
+                "/api/import/import/",
+                {"profile_id": self.profile.id, "file": file1},
+                format="multipart",
+            )
+            self.assertEqual(response1.status_code, status.HTTP_202_ACCEPTED)
+            first_id = response1.data["import_run_id"]
+
+            file2 = SimpleUploadedFile(
+                "dup.csv", csv_content, content_type="text/csv"
+            )
+            response2 = self.client.post(
+                "/api/import/import/",
+                {"profile_id": self.profile.id, "file": file2},
+                format="multipart",
+            )
+
+        self.assertEqual(response2.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response2.data["import_run_id"], first_id)
+        self.assertEqual(ImportRun.objects.filter(profile=self.profile).count(), 1)
+        self.assertEqual(mock_defer.call_count, 1)
+
     def test_create_import_missing_profile(self):
         """Test request without profile_id returns 400"""
         csv_content = b"date,description,amount\n2025-01-01,Test,100"

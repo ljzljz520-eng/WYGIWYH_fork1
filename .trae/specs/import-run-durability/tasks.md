@@ -1,0 +1,247 @@
+# ImportRun 持久化暂存与事务化导入改造 - 实现计划
+
+> 实现顺序遵循依赖；每个任务完成时必须自验全部 TR 并补全 Completion Evidence。
+> 关键文件：[models.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/models.py)、[services/v1.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py)、[tasks.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tasks.py)、[views.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/views.py)、[api/views/imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/views/imports.py)、[api/serializers/imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/serializers/imports.py)。
+
+## Task 1: 数据模型与迁移（ImportRun 扩展 + ImportRow 暂存模型）
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: None
+- **Completion Evidence**:
+  - TR-1.1: `makemigrations import_app` 生成 0003 迁移并在 PostgreSQL 15 成功 apply；`makemigrations --check --dry-run` 输出 No changes detected；新字段均有默认值/null，旧 Run 可读
+  - TR-1.2: shell 断言同 profile+file_hash 两个 QUEUED Run → IntegrityError；其一 FINISHED 后允许新建（PASS）
+  - TR-1.3: 同 Run 重复 sequence 与重复 idempotency_key 均 IntegrityError（PASS）
+  - 产物：[models.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/models.py)、迁移 0003
+- **Description**:
+  - 扩展 `ImportRun`：新增 `mode`（strict/fault_tolerant，默认 strict）、`phase`（enqueued/parsing/committing/finished/failed，默认 enqueued）、`file_hash`(db_index, null)、`file_size`(null)、`stored_file_path`、`config_snapshot`(TextField, blank)、`source_summary`(JSONField, default=dict)、`cursor`(JSONField, default=dict)、`retryable_rows`(default=0)、`lease_owner`(null)、`lease_expires_at`(null)、`run_attempts`(default=0)。
+  - 新增 `ImportRow`：FK run（related_name="rows"）、sequence(int)、section(str, blank)、row_number(int)、raw_payload(JSON)、mapped_payload(JSON null)、status（TextChoices：PENDING/STAGED/COMMITTED/SKIPPED/FAILED_RETRYABLE/FAILED_PERMANENT，默认 PENDING）、failure_reason(JSON null)、attempts(default=0)、transaction FK SET_NULL（null）、committed_at(null)。
+  - 约束/索引：UniqueConstraint(run, sequence)；UniqueConstraint(run, idempotency_key)；条件唯一约束 `UniqueConstraint(fields=["profile","file_hash"], condition=Q(status__in=["QUEUED","PROCESSING"]), name="uniq_active_run_profile_filehash")`；Index(run, status)。
+  - ImportRow 增加 `idempotency_key` CharField(max_length=64, db_index)。
+  - 不改动既有 m2m 与计数字段语义；`makemigrations import_app` 生成一个迁移。
+- **Acceptance Criteria Addressed**: AC-1, AC-2
+- **Test Requirements**:
+  - `rule` TR-1.1: `makemigrations --check` 无缺失迁移；`migrate` 在测试库成功；新字段默认值保证旧 Run 可读
+  - `rule` TR-1.2: 尝试为同 profile+file_hash 创建两个 QUEUED Run 触发 IntegrityError；同 hash 但其一 FINISHED 时允许新建
+  - `rule` TR-1.3: 同 Run 内重复 sequence / idempotency_key 触发 IntegrityError
+- **Notes**: 条件唯一约束依赖 PostgreSQL；`stored_file_path` 不进 API 序列化字段。
+
+## Task 2: 入队链路改造（文件摘要、配置快照、重复提交防护）
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 1
+- **Completion Evidence**:
+  - TR-2.1: API 同内容二次上传返回 409 且 import_run_id 一致、仅 defer 一次（test_duplicate_active_file_returns_409 PASS）；不同内容 202 用例沿用旧测试 PASS
+  - TR-2.2: Web 视图重复上传两次均 204 且仅 1 个 Run（test_web_duplicate_upload_is_204_without_new_run PASS）；重复时 messages.info 提示
+  - TR-2.3: test_creates_run_with_summary_snapshot_and_mode 断言 file_hash=sha256、file_size、config_snapshot=入队 YAML、mode 派生（fault_tolerant/strict 两用例）
+  - TR-2.4: 部分唯一约束 + IntegrityError 回查既有 Run 双保险（Task 1 约束测试 PASS）；重复提交不新增暂存文件（目录断言 PASS）
+  - 产物：[services/enqueue.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/enqueue.py)、[views.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/views.py)、[api/views/imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/views/imports.py)、[api/serializers/imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/serializers/imports.py)；`apps.import_app.tests.test_enqueue` + api 测试共 22 项全绿
+- **Description**:
+  - 新增入队辅助（如 `services/enqueue.py` 或在 services 包内增加 `create_import_run(profile, uploaded_file)`）：流式计算 SHA-256 与 file_size；通过 FileSystemStorage 保存到 TEMP_DIR；写入 ImportRun（file_hash/file_size/stored_file_path/file_name/config_snapshot=当前 profile.yaml_config、mode 由快照 skip_errors 派生、source_summary 初始空）；捕获条件唯一约束竞态（IntegrityError → 返回既有活动 Run）。
+  - Web 视图 `import_run_add`：改用辅助函数；重复时 `messages.info` 提示已存在进行中的 Run（不报错），仍返回 HX-Trigger updated。
+  - API `ImportViewSet.create`：重复时返回 `409`，负载含既有 `import_run_id`/`status`。
+  - 任务投递参数从 Run 行读取（import_run_id + stored_file_path + user_id），保持 tasks.py 签名兼容。
+  - `ImportRunSerializer` 增补：mode、phase、file_hash、retryable_rows、lease_expires_at、cursor、source_summary（不输出 stored_file_path/logs 保持原样）。
+- **Acceptance Criteria Addressed**: AC-1, AC-9, AC-12
+- **Test Requirements**:
+  - `rule` TR-2.1: API 连续两次上传同内容文件：第二次 409 且返回第一次的 run_id；不同内容返回 202 新 run
+  - `rule` TR-2.2: Web 重复上传不新建 Run，响应 204 且 messages 含提示
+  - `rule` TR-2.3: Run 行的 file_hash/file_size/config_snapshot/mode 与上传文件、入队时 YAML 一致；之后修改 profile.yaml_config 不影响 Run 的 config_snapshot
+  - `rule` TR-2.4: 并发双请求（线程或事务内重复 create）最终仅 1 个活动 Run，不泄漏临时文件（失败分支保存失败时清理）
+- **Notes**: 保存→建 Run 之间失败需清理已存文件，避免孤儿。
+
+## Task 3: 统一源行迭代器与阶段 1（解析/验证/暂存）
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 1
+- **Completion Evidence**:
+  - TR-3.1 PASS：`test_tr31_csv_rows_staged_with_serializable_mapped_payload`、`test_tr31_excel_rows_staged_with_sheet_as_section` 断言 CSV/Excel 阶段 1 后 ImportRow 数=源行数、STAGED、mapped_payload JSON 可序列化；source_summary.sections 按文件/sheet 计数；QIF 由 test_qif_import 5 用例与 test_tr52 ZIP 用例覆盖
+  - TR-3.2 PASS：`test_tr32_invalid_row_is_permanent_and_strict_aborts_with_zero_tx`（缺必填日期 → FAILED_PERMANENT/stage=validate/line 正确、严格即终止 0 交易）、`test_tr32_missing_reference_rejected_in_strict_stage1`（account 不存在 → validate 失败）；QIF 坏日期/缺账户由 test_qif_import 严格用例覆盖
+  - TR-3.3 PASS：`test_tr33_parse_and_stage_is_idempotent_on_reentry` 连续两次 parse_and_stage 后仍为 2 行（idempotency_key 去重 + bulk_create ignore_conflicts）
+  - TR-3.4 rubric=5：三格式共用 `_stage_tabular_row`/批量暂存/游标/计数基础设施，仅 [source_rows.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/source_rows.py) 三个读取器不同；`_map_row`/`_transform_value`/`_coerce_*` 零改动复用
+  - 产物：[source_rows.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/source_rows.py)、[v1.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py)（parse_and_stage/_stage_qif_row/_validate_references）、[test_pipeline.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tests/test_pipeline.py)
+- **Description**:
+  - 在服务层引入统一行源（yield `RawRow(section, row_number, payload:dict|QIF record)`）：
+    - CSV：沿用 encoding/delimiter/skip_lines，section=文件名；
+    - Excel：openpyxl(xlsx)/xlrd(xls)，section=sheet 名，沿用 start_row/sheets/日期转换；
+    - QIF：按 `^` 切分记录，section=文件名（ZIP 各成员名），raw 保留原始行列表 + 已解析的 D/T/P/M/L/N 字段。
+  - 阶段 1 `parse_and_stage()`：幂等（重入时仅处理 PENDING/无 ImportRow 的位置，以 (run,sequence) 定位）；逐行：CSV/Excel 走现有 `_map_row`（含 transform/coerce/required）+ 外部对象预校验（account/category/tags/entities/currency 的 id/name 与 create 语义；不可解析/找不到且 create=false → validate 失败）；QIF 执行日期/金额解析与账户存在性校验，产出与现有字段一致的 mapped_payload（account 实例在阶段 2 再解析为对象，暂存仅存可序列化值/对象 id）。
+  - 成功行 status=STAGED、mapped_payload 落库；失败行 FAILED_PERMANENT + failure_reason{stage,code,message,line}。
+  - 批量写入 ImportRow（分块 bulk_create，ignore_conflicts 配合 (run,sequence)）；total_rows 与游标在独立事务中按批更新；phase=parsing。
+  - source_summary 填充（各 section 行数、文件大小、哈希）。
+  - mapped_payload 中仅放 JSON 可序列化值（date→isoformat/对象→id），在阶段 2 还原。
+- **Acceptance Criteria Addressed**: AC-2, AC-4（解析侧）, AC-12
+- **Test Requirements**:
+  - `rule` TR-3.1: 三格式样例文件阶段 1 后 ImportRow 行数 = 源记录数，STAGED 行 mapped_payload 非空且可 JSON 序列化
+  - `rule` TR-3.2: CSV 缺必填/坏日期、Excel 类型错误、QIF 非法日期与缺失账户分别产生 FAILED_PERMANENT 且 failure_reason.stage ∈ {parse,validate}，严格模式下阶段 1 即终止且零交易
+  - `rule` TR-3.3: 阶段 1 中断后重入不产生重复 ImportRow，已 STAGED/PERMANENT 行不重算
+  - `rubric` TR-3.4: 复用现有映射/转换代码的程度；scale 1-5；anchors 1=大段复制粘贴两套逻辑，3=部分复用，5=三格式共用映射/暂存基础设施仅读取器不同；threshold >= 4；证据=代码走读
+
+## Task 4: 阶段 2 提交器（严格单事务 / 容错保存点）与计数口径
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 3
+- **Completion Evidence**:
+  - TR-4.1/4.3/4.5 PASS：`test_tr414345_strict_commit_failure_rolls_back_but_keeps_diagnostics`——注入第 2 行 ValueError，Transaction=0、successful_rows=0；回滚后失败行 FAILED_PERMANENT（stage=commit/code=ValueError）、第 1 行回到 STAGED、failed/processed=1 仍可查；定位策略：逐行提交时在内存推进 `current`（sequence/section/row_number），异常块回滚后 refresh 并在独立事务标记，Run 不会出现无诊断 FAILED（代码注释已写明，TR-4.5）
+  - TR-4.2 PASS：`test_tr42_fault_tolerant_mixed_rows_partial_commit`——3 行（好/坏/好），2 笔入库、坏行 FAILED_PERMANENT 无对象残留、processed=committed+skipped+failed=3，FINISHED
+  - TR-4.4 PASS：`test_tr44_transient_error_classified_retryable`（OperationalError → FAILED_RETRYABLE、retryable_rows=1）、`test_tr44_attempts_increment_across_retries`（重置 STAGED 后再次提交 attempts=2）；failure_reason 含 stage/code/message/line/section
+  - TR-4.6 PASS：`test_tr46_compare_dedupe_marks_row_skipped`（compare 命中 → SKIPPED、0 新交易、skipped_rows=1）；QIF internal_id 二次导入=1 笔由 test_import_deduplication_hash 覆盖
+  - 计数全部由 `_reconcile_counters` 从 ImportRow 终态聚合派生（独立 UPDATE，领域回滚后仍可见），successful 仅在 atomic 成功退出后非零
+  - 产物：[v1.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py)（commit_rows/_commit_row/_mark_failed_rows/_reconcile_counters）、[test_pipeline.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tests/test_pipeline.py)
+- **Description**:
+  - 实现 `commit_rows()`：
+    - 严格模式：单个 `transaction.atomic()`：遍历 STAGED 行，从 mapped_payload 还原对象（account/category/tag/entity/currency 按既有 create/get/filter 语义）、去重判定（compare 规则；命中 → 行 SKIPPED，不建对象）、创建领域对象并维护 Run 的 m2m 关联、回填 ImportRow.transaction/committed_at/status=COMMITTED；成功退出后在独立事务批量更新计数（仅此刻 successful+N）。异常 → 块回滚；回滚后在独立事务标记失败行（定位异常行：TR-4.5 设计）为 FAILED_RETRYABLE（OperationalError/死锁/连接类）或 FAILED_PERMANENT（ IntegrityError/数据类），Run phase=failed；successful 保持 0。
+    - 容错模式：每行 `with transaction.atomic():`（autocommit 外层 → 行级事务）；行内异常回滚该行并分类落 FAILED_*；成功 → COMMITTED 并按批节流更新计数；去重命中 → SKIPPED。processed 按批独立事务落库。
+  - 计数统一从 ImportRow 终态**派生并按批对账**（committed/skipped/failed/retryable），避免崩溃导致计数漂移；processed=四类之和。
+  - 日志仍写 Run.logs，但结构化失败以 ImportRow.failure_reason 为准。
+  - 服务主流程改为：acquire_lease → 校验文件存在（否则 FAILED + code=source_file_missing）→ parse_and_stage → 严格模式阶段1有 PERMANENT 即终止 → commit_rows → 收尾（phase/finished_at/文件清理见 Task 8）。
+- **Acceptance Criteria Addressed**: AC-3, AC-4, AC-5, AC-6
+- **Test Requirements**:
+  - `rule` TR-4.1: 严格模式阶段 2 注入提交异常：Transaction 计数 0、Run.successful_rows=0、failed/retryable 计数与 ImportRow 诊断在回滚后仍可查
+  - `rule` TR-4.2: 容错模式三格式混合好坏行：合法行入库、坏行无对象残留、计数 processed=committed+skipped+failed
+  - `rule` TR-4.3: successful_rows 只在 atomic 成功退出后增长（提交途中异常时断言从未增长）
+  - `rule` TR-4.4: failure_reason 含 stage/code/message/line；attempts 每次重试 +1；瞬时异常 → RETRYABLE 且 retryable_rows 正确
+  - `rule` TR-4.5: 严格模式异常行可定位（逐行提交时捕获当前 sequence；或阶段2采用「先尝试整批、失败后二分/逐行诊断模式」——实现需在代码与证据中说明定位策略，最终至少有 1 行被标记且 Run 不出现「无诊断的 FAILED」）
+  - `rule` TR-4.6: 去重命中（compare 与 QIF internal_id）行=SKIPPED 且不创建交易，skipped_rows 正确
+
+## Task 5: QIF 管线统一（ZIP 分节、internal_id、映射语义保持）
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 4
+- **Completion Evidence**:
+  - TR-5.1 PASS：`apps.import_app.tests.test_qif_import` 全部 5 用例通过（合法两条含 category/tag/transfer、重复内容两次导入=1、严格坏日期 0 笔+Import failed、缺账户失败、容错 1 笔）
+  - TR-5.2 PASS：`test_tr52_qif_zip_uses_members_as_sections_and_ignores_junk`——ZIP 含 2 个 .qif 成员 + `__MACOSX/._*.qif` + notes.txt，仅 2 成员入库，section 计数正确（internal_id 沿用旧语义不含账户名，相同内容跨成员仍去重，测试用不同内容）
+  - TR-5.3 PASS：容错混合用 test_import_skip_errors（1 好 1 坏=1 笔），严格整单回滚 test_import_strict_error_rollback（0 笔）
+  - TR-5.4 PASS：`test_tr54_qif_never_defers_rules` 断言 QIF 零 defer；`_create_qif_transaction` 显式不调用 `_schedule_rules`（QIFImportSettings 无 trigger_transaction_rules 字段，注释说明）
+  - 旧 `_parse_and_import_qif`/`_process_qif` 已删除，QIF 走统一 parse_and_stage/commit_rows（专用 `_stage_qif_row` + `_create_qif_transaction`）；internal_id=strip 后非空行（含 `!Type:`/`^`）拼接 sha256，与旧实现逐字节一致
+  - 产物：[source_rows.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/source_rows.py)（iter_qif_records）、[v1.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py)
+- **Description**:
+  - 用 Task 3/4 的统一管线重写 `_parse_and_import_qif`/`_process_qif`，删除其私有事务/计数路径；保留：账户名=文件名去扩展名、缺失账户失败、D 日期（date_format）、T 金额正负→type、P→entity(get_or_create)、M→description、L 的 `[Transfer]` 与 `Cat:Tag:...` 拆分、N 忽略、`!Type:` 头忽略、internal_id=原始记录行 sha256（已存在→SKIPPED）、ZIP 遍历（忽略 __MACOSX、仅 .qif）。
+  - QIF 无 profile mapping；mapped_payload 由 QIF 专用 mapper 产出，复用阶段 2 的交易创建器。
+  - `trigger_transaction_rules` 对 QIF：QIFImportSettings 无该字段（现状），保持现状等价行为（现状 QIF 从不发信号 → 维持不触发，除非后续给 schema 加字段；本任务显式确认并注释）。
+- **Acceptance Criteria Addressed**: AC-12, AC-13
+- **Test Requirements**:
+  - `rule` TR-5.1: `apps/import_app/tests/test_qif_import.py` 全部用例通过（合法两条、哈希去重两次导入=1、严格坏日期 0 笔+Import failed、缺账户失败、容错 1 笔）
+  - `rule` TR-5.2: ZIP 含 2 个 qif 成员 + __MACOSX 垃圾项时，仅处理两个成员，section 与行数正确
+  - `rule` TR-5.3: 容错 QIF 坏行不影响好行；严格 QIF 整单回滚（与旧语义一致）
+  - `rule` TR-5.4: QIF 导入不触发规则任务（与现状一致），CSV trigger=true 时触发
+
+## Task 6: 规则任务 on_commit 恰好一次入队
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 4
+- **Completion Evidence**:
+  - TR-6.1 PASS：`test_tr61_fault_mode_defers_rules_once_per_committed_row`——容错 2 好 1 坏，mock `check_for_transaction_rules.defer` 恰好 2 次，kwargs 含 instance_id/signal=transaction_created/queueing_lock=`import-rule-created-<tx_id>`；坏行零次
+  - TR-6.2 PASS：`test_tr62_strict_rollback_defers_zero`（注入异常整批回滚，defer 0 次）+ `test_tr62_strict_success_defers_per_transaction`（严格成功 2 笔=2 次；on_commit 在大 atomic 提交后统一触发）
+  - TR-6.3 PASS：COMMITTED/SKIPPED/PERMANENT 行不在 `_actionable_rows` 中，重放零 defer（test_import_deduplication_hash 二次跑同 run 不重复）；`test_tr63_enqueue_conflict_is_swallowed`——defer 抛任意异常仅 debug 日志、不外溢，Run 仍 FINISHED；queueing_lock 提供跨进程/跨任务的最终去重
+  - TR-6.4 PASS：`test_tr64_trigger_disabled_defers_zero`（trigger_transaction_rules=false 零 defer）
+  - 评审后加固（minor-3）：on_commit 回调窄化——`AlreadyEnqueued` 走 debug 静默（`test_tr63b_already_enqueued_is_deduped_silently` 无 Run 日志），其他异常 warning + 追加 Run 日志 "Rule enqueue failed for transaction"（`test_tr63_enqueue_conflict_is_swallowed` 断言），作业失败不再无痕丢失
+  - 导入创建器中原 `transaction_created.send` 已移除（grep 确认 import_app 无残留）；其他调用点（transactions views/forms/models、api）未改动
+  - 产物：[v1.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py)（_schedule_rules）、[test_pipeline.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tests/test_pipeline.py)
+- **Description**:
+  - 导入创建器中移除 `transaction_created.send(...)`；在每行事务提交成功后注册 `transaction.on_commit` 回调，回调内 `check_for_transaction_rules.defer(instance_id=tx.id, user_id=..., signal="transaction_created", queueing_lock=f"import-rule-created-{tx.id}")`，捕获 procrastinate already-enqueued/唯一冲突并记 debug 日志。
+  - 严格模式在外层大事务提交后统一注册（事务内收集 tx ids，退出 atomic 后注册 on_commit 或直接在块后 defer——必须保证仅提交成功时执行）；容错模式每行业务在各自 atomic 成功退出后 defer。
+  - 仅当 settings.trigger_transaction_rules 为真（CSV/Excel）；user_id 取 thread_local 当前用户，任务上下文中已写入。
+  - 信号接收器对其他调用点保持不变。
+- **Acceptance Criteria Addressed**: AC-8
+- **Test Requirements**:
+  - `rule` TR-6.1: trigger=true 的容错导入：每笔提交交易恰好一次 defer，参数含 instance_id/signal；回滚坏行零次 defer
+  - `rule` TR-6.2: 严格模式全部回滚时 defer 零次；全部成功时 defer 数=交易数
+  - `rule` TR-6.3: 恢复重放已 COMMITTED 行不产生第二次 defer；同 queueing_lock 重复 defer 被吞且无异常逃逸
+  - `rule` TR-6.4: trigger=false 时零 defer
+
+## Task 7: 租约、崩溃恢复与手动重试
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 4
+- **Completion Evidence**:
+  - TR-7.1 PASS：`test_tr71_resume_after_worker_crash_no_duplicates`（TransactionTestCase）——4 行容错 CSV，前 2 行随真实事务提交后模拟 worker 死亡（PROCESSING+过期租约），`process_import.func(...)` 恢复执行：最终 4 笔交易无重复、4 行 COMMITTED、successful/processed=4、FINISHED 后临时文件删除
+  - TR-7.2 PASS：`test_tr72_fresh_lease_second_instance_is_noop`——新鲜租约下第二实例仅写 "already leased" warning 后空转返回，0 笔交易、lease_owner 不变
+  - TR-7.3 PASS：`test_tr73_periodic_recovery_defer_only_expired_processing`——4 个 Run（过期 PROCESSING/新鲜 PROCESSING/QUEUED/FINISHED），周期任务返回 {candidates:1,recovered:1}，仅对过期 Run defer 一次且 queueing_lock=`import-recover-run-<id>`
+  - TR-7.4 PASS：服务级 `test_tr74_strict_retry_clears_rows_and_requques`（行全删、计数归零、QUEUED/enqueued、清 lease、defer 1 次）、`test_tr74_fault_retry_keeps_terminal_resets_retryable`（COMMITTED 保留，RETRYABLE→STAGED 且 failure_reason 清空，attempts=3 保留）、`test_tr74_finished_and_queued_not_retriable`（RetryNotAvailable 409 run_not_retriable）、`test_tr74_missing_file_blocks_retry_without_reset`（409 source_file_missing，Run 仍 FAILED）；API 级 `test_tr74_api_retry_accepted`（202 {import_run_id,status:queued}）/`test_tr74_api_retry_conflict_states`（FINISHED 409、文件缺失 409 code=source_file_missing）
+  - TR-7.5 PASS：`test_tr75_web_retry_accepted`（204 + HX-Trigger "updated, hide_offcanvas"，Run→QUEUED，defer 1 次）、`test_tr75_web_retry_not_available_stays_204`（FINISHED 204 + error message，无 defer）
+  - 评审后加固（独立评审 major-1）PASS：
+    - TR-7.6 `test_tr76_concurrent_row_claim_creates_no_duplicate`——双线程跨 DB 连接竞争同一 STAGED 行：A 持行事务 1.5s，B 的条件领取 UPDATE 阻塞到 A 提交后按新行版本匹配 0 行 → LeaseLostError 中止，最终仅 1 笔交易、行 COMMITTED
+    - TR-7.7 租约失主静默退出：`..._strict_commit_aborts_quietly`（严格在大事务前 `_check_lease` 失败→0 交易、Run 仍 PROCESSING、文件保留、不抛异常）与 `..._fault_work_leaves_finalization`（容错已提交 4 笔但条件 `_finalize` 失败→不覆写状态、不删文件、计数仍由对账落库）
+    - TR-7.8 `test_tr78_retry_collision_rolls_back_row_reset`——严格 FAILED 重试时同 profile+哈希已有 QUEUED Run：条件迁移触发部分唯一约束，整个 atomic 回滚（行删除撤销、状态仍 FAILED、defer 未调用），409 active_run_exists
+    - TR-7.9 `test_tr79_commit_phase_cursor_advances`——提交阶段每批/收尾推进 cursor={phase:"committing",sequence}
+  - 加固实现：v1.py 新增 LeaseLostError；`_heartbeat` 返回 bool + `_check_lease`（无租约直构实例不围栏）；`_commit_row` 首语句为条件领取 UPDATE（STAGED/RETRYABLE/PENDING→PENDING，0 行即失主）；终结走条件化 `_finalize`，失主不写终态/不删文件；retry.py 改为「条件 UPDATE 迁移 + 同事务重置 + IntegrityError 整体回滚」
+  - 产物：[retry.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/retry.py)、[tasks.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tasks.py)、[models.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/models.py)（ImportRun.is_retriable）、迁移 0004_importrun_requested_by、[imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/views/imports.py)（retry action）、[views.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/views.py)、[test_recovery.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tests/test_recovery.py)
+- **Description**:
+  - `process_import` 任务重写：加载 Run（config_snapshot 构建服务）→ `acquire_lease`（条件 UPDATE：QUEUED 或 lease_expires_at<now；UPDATE 行数=0 则退出）→ run_attempts+1 → 执行管线（心跳：每批续租 lease_expires_at=now+TTL）→ 终结时清/置租约。
+  - 管线幂等恢复：阶段1按 (run,sequence) 跳过已存在行；阶段2仅取 STAGED/FAILED_RETRYABLE（自动恢复仅 RETRYABLE；手动重试见下）行；游标读 Run.cursor。
+  - 严格 FAILED 手动重试：清空该 Run 的 ImportRow、重置计数/phase/cursor，从 stored_file_path 重新两阶段。
+  - 容错手动重试：保留 COMMITTED/SKIPPED/PERMANENT，将 RETRYABLE 重置为 STAGED（attempts 保留），PENDING 继续；文件缺失 → 拒绝。
+  - 新增周期任务 `recover_stale_import_runs`（procrastinate periodic，如每 5 分钟）：找 PROCESSING 且 lease_expires_at<now 的 Run，re-defer process_import（queueing_lock 粒度到 run，如 `recover-import-<run_id>`，或先 defer 并由租约兜底）。
+  - Web：新增 `import_run_retry` 视图（POST，profile_id/run_id），投递后 messages.success + HX updated；API：ImportRunViewSet 增加 `@action(detail=True, methods=["post"]) retry`，202 返回 run_id；不可重试状态返回 409/400。
+- **Acceptance Criteria Addressed**: AC-7, AC-10
+- **Test Requirements**:
+  - `rule` TR-7.1: 模拟「处理 2 行后崩溃」（在第 2 行提交后令任务异常退出，租约过期）→ 再次执行任务：最终交易/计数/ImportRow 状态与一次跑完一致，无重复交易
+  - `rule` TR-7.2: 租约未过期时第二个任务实例空转退出（不处理任何行、不投递规则）
+  - `rule` TR-7.3: 周期任务对过期 PROCESSING Run 重新 defer；对新鲜租约/非 PROCESSING Run 不动作
+  - `rule` TR-7.4: API retry：严格 FAILED Run 被重置并重跑（暂存行重建）；容错 Run 仅 RETRYABLE 行重试，COMMITTED 行不重复；FINISHED/QUEUED 返回 409；文件缺失返回 409 且 Run 不被重置
+  - `rule` TR-7.5: Web retry 视图返回 204 且任务被 defer
+
+## Task 8: 临时文件生命周期与孤儿清理
+- **Status**: `completed`
+- **Priority**: medium
+- **Depends On**: Task 2, Task 7
+- **Completion Evidence**:
+  - TR-8.1 PASS：`test_tr81_finished_deletes_failed_keeps_file`——容错 4 行成功后 good.csv 被删；严格 1 坏行 FAILED 后 bad.csv 保留，Run=FAILED（严格坏日期 QIF 用例亦验证 source_file_missing 不删除）
+  - TR-8.2 PASS：`test_tr82_web_delete_removes_file`——DELETE runs/<id>/delete/ 后 204、文件不存在、Run 行删除；`_remove_run_file` best-effort 吞 OSError 仅 warning
+  - TR-8.3 PASS：`test_tr83_cleanup_removes_only_old_unreferenced_files`——3 文件（FAILED 引用/referenced、24h 内新孤儿 fresh、25h 老孤儿 old），cleanup 任务返回 {scanned:3,removed:1}：referenced 与 fresh 保留、old 删除；白名单=QUEUED/PROCESSING/FAILED 的 abspath stored_file_path，宽限期 24h（ORPHAN_GRACE_PERIOD_SECONDS）
+  - TR-8.4 PASS：Task 2 `test_duplicate_upload_leaves_no_extra_file`——重复提交第二次不写文件（FileSystemStorage.save 仅在 created 路径发生），目录内容前后一致
+  - 产物：[tasks.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/tasks.py)（cleanup_orphan_temp_files，cron 30 3 * * *，queueing_lock 同名）、[enqueue.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/enqueue.py)（ORPHAN_GRACE_PERIOD_SECONDS/DEFAULT_TEMP_DIR）、[views.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/views.py)（_remove_run_file）
+- **Description**:
+  - 服务收尾改造：FINISHED 删除 stored_file_path；FAILED 保留；source_file_missing 不再尝试删除。
+  - Run 删除链路（Web 视图 + DRF 没有删除 endpoint，保持；admin 级联）：删除文件（best-effort，记录 warning）。
+  - 新增周期任务 `cleanup_orphan_temp_files`（如每日）：扫描 TEMP_DIR，计算「被 QUEUED/PROCESSING/FAILED 且文件存在的 Run 引用」白名单 + 宽限期（mtime 早于配置阈值，如 24h），删除无主过期文件；目录校验仍走 `_validate_file_path`。
+- **Acceptance Criteria Addressed**: AC-11
+- **Test Requirements**:
+  - `rule` TR-8.1: FINISHED 后文件不存在；FAILED（含严格回滚、source_file_missing）后文件保留
+  - `rule` TR-8.2: 删除 Run 时其专属文件被删除；删除失败仅 warning 不抛
+  - `rule` TR-8.3: 清理任务删除「无 Run 引用且超宽限期」文件，不删除被活动/FAILED Run 引用的文件与宽限期内的新文件
+  - `rule` TR-8.4: Task 2 入队失败路径不留临时文件
+
+## Task 9: Web 页面与 API 诊断/重试展示
+- **Status**: `completed`
+- **Priority**: medium
+- **Depends On**: Task 7
+- **Completion Evidence**:
+  - TR-9.1 PASS：`test_tr91_run_card_shows_retryable_count_and_retry_button`——FAILED Run 卡片含 "Retryable Items" 计数卡与 retry URL；FINISHED Run 无 retry 链接；过期 PROCESSING 头部显示 warning 态与 "lease expired" 标注，头部右侧展示 mode · phase
+  - TR-9.2 PASS：`test_tr92_log_renders_failed_rows_table`——log offcanvas 渲染失败行表（section/row_number/状态 retryable|permanent/stage/code/message/attempts=<td>2</td>），logs 文本保留；视图聚合 FAILED_RETRYABLE+FAILED_PERMANENT 按 sequence 传入
+  - TR-9.3 PASS：`test_tr93_rows_action_with_status_filter`——GET /api/import/runs/<id>/rows/?status=FAILED_PERMANENT 分页返回 1 行（白名单字段，无 raw_payload/mapped_payload/stored_file_path），failure_reason.code 可见；实现注记：rows action 用 get_object_or_404(ImportRun) 而非 self.get_object()，避免 Run 级 django-filter 把行 status 参数误当 Run 状态校验返回 400
+  - TR-9.4 PASS：`test_tr94_run_detail_exposes_diagnostics_fields`——run detail 含 mode/phase/retryable_rows/file_hash/cursor/source_summary；filterset 的 mode/phase/retryable_rows 在 Task 2 已落地
+  - i18n：`manage.py makemessages -l en` 已重新提取，新增文案（Retryable Items、Retry、Retry this import run?、lease expired、Failed rows、Section/Row/Status/Stage/Code/Message/Attempts、retryable/permanent）均入 en django.po，其余 13 语言走 gettext 英文占位回退
+  - 产物：[list.html](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/templates/import_app/fragments/runs/list.html)、[log.html](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/templates/import_app/fragments/runs/log.html)、[views.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/views.py)、[imports.py](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/api/views/imports.py)、[django.po](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/locale/en/LC_MESSAGES/django.po)
+- **Description**:
+  - `runs/list.html`：新增 Retryable 计数卡；状态区显示 phase/租约异常态；对 FAILED 与过期 PROCESSING Run 显示重试按钮（hx-post import_run_retry）；计数命名对齐 committed/skipped/failed/retryable（successful 展示文案可沿用「成功/已提交」）。
+  - `runs/log.html`：保留 logs 文本；新增失败/可重试行明细表（section、row_number、stage、code、message、attempts），数据由 `import_run_log` 视图聚合传入。
+  - API：ImportRunViewSet 增加 `@action(detail=True) rows`（分页序列化 ImportRow，支持 status 参数过滤）；ImportRowSerializer 字段白名单（不输出 mapped_payload 原文以控制体积？包含 raw/mapped 摘要——决策：输出 failure_reason/状态/行号/attempts/committed_at，不含 raw_payload）。
+  - 列表 filterset 增补 mode/phase/retryable_rows。
+  - i18n：新增文案补 `locale/en` 与 `locale/zh_Hant`（若存在 zh 习惯）及至少 `de`？仓库有 14 种语言；按既有惯例至少 en，其余走 gettext 占位。
+- **Acceptance Criteria Addressed**: AC-12
+- **Test Requirements**:
+  - `rule` TR-9.1: Run 卡片对含 failed/retryable 的 Run 渲染对应计数与重试按钮；FINISHED Run 无重试按钮
+  - `rule` TR-9.2: log offcanvas 渲染失败行结构化明细
+  - `rule` TR-9.3: `GET /import/runs/{id}/rows?status=FAILED_RETRYABLE` 返回可重试行分页；字段不含 stored_file_path/raw_payload
+  - `rule` TR-9.4: API run detail 含 mode/phase/retryable_rows/file_hash/cursor/source_summary
+- **Notes**: 不新增页面，仅扩展现有 offcanvas 片段。
+
+## Task 10: 回归测试与全量验证
+- **Status**: `completed`
+- **Priority**: high
+- **Depends On**: Task 1-9
+- **Completion Evidence**:
+  - TR-10.1 PASS（2026-10-05，评审后加固复跑）：`SECRET_KEY=dev DEBUG=true SQL_DATABASE=wygiwyh SQL_USER=wygiwyh SQL_PASSWORD=wygiwyh SQL_HOST=127.0.0.1 SQL_PORT=55432 ../.venv/bin/python manage.py test apps.import_app apps.api apps.rules -v 1` → **Ran 197 tests — OK**；含既有 test_qif_import.py（5）、test_import_service_v1.py、api/test_imports.py 与新增 test_pipeline.py（18）、test_recovery.py（23）、test_enqueue.py
+  - TR-10.2 PASS：`manage.py makemigrations --check --dry-run` → "No changes detected"，EXIT=0；system check 仅余两个既有无害 WARNING（django_vite manifest 缺失、frontend/build 不存在），与改造前一致，无新增
+  - TR-10.3 rubric 自评 **5/5**：测试覆盖四类故障注入——①崩溃恢复（TR-7.1 TransactionTestCase 真提交模拟死亡后续跑无重复）②并发（TR-7.2 新鲜租约空转、Task 2 同 profile+哈希 409/Web 204）③回滚（TR-3.2 严格坏行零入账、TR-4.1/4.3 注入 ValueError、TR-6.2 回滚零规则 defer，且回滚后诊断行仍可见）④恰好一次（TR-6.1 on_commit 次数+queueing_lock、TR-4.6 compare 去重 SKIPPED、TR-3.3 幂等重入）；外加严格/容错 × CSV/Excel/QIF(+ZIP+__MACOSX) 全矩阵、临时文件白名单/宽限清理、API/Web retry 全状态分支
+  - NFR-2 走读（无明显 N+1）：①暂存写入 1 次 existing_keys 查询 + 每 200 行一次 bulk_create(ignore_conflicts)，cursor/计数/心跳同样每 200 行节流一次（[v1.py L838-913](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py#L838-L913)）；②`_reconcile_counters` 单条 GROUP BY 聚合 + 单条 UPDATE，不按行计数（[v1.py L1435+](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py#L1435)）；③提交阶段每行业务查询（get_or_create/compare 去重）是领域语义固有成本，与旧导入器一致，计数/心跳每 200 行一次（[v1.py L1425](file:///Users/kkcarrot/swe-project/WYGIWYH_fork1/app/apps/import_app/services/v1.py#L1425)）；④log offcanvas 失败明细为单次 values() 查询；已知非阻塞项：`_log` 按失败行追加（O(失败行) UPDATE，保证回滚后诊断可见的刻意设计），大文件全坏行场景可后续改为批内追加
+- **Description**:
+  - 补齐测试矩阵：严格/容错 × CSV/Excel(xlsx)/QIF(+ZIP)；去重跳过；回滚后诊断；游标恢复；租约；并发 409；retry（Web+API，严格/容错/文件缺失/非法状态）；规则 on_commit 次数；临时文件清理；行诊断 API。
+  - 运行 `python manage.py test apps.import_app apps.api apps.rules`（在可执行环境中）与 `makemigrations --check`；修复回归。
+  - 核对 NFR-2：批量写入与计数节流无明显 N+1（代码走读说明）。
+- **Acceptance Criteria Addressed**: AC-14, 全部 AC 的回归兜底
+- **Test Requirements**:
+  - `rule` TR-10.1: 上述测试命令全部通过（粘贴结果）；既有 test_qif_import.py / test_import_service_v1.py / api/test_imports.py 全绿
+  - `rule` TR-10.2: `makemigrations --check` 干净；无新增 Django system check 警告
+  - `rubric` TR-10.3: 测试质量与覆盖维度；scale 1-5；anchors 1=仅 happy path，3=主路径+部分故障注入，5=含崩溃恢复/并发/回滚/恰好一次四类故障注入；threshold >= 4；证据=测试清单与走读

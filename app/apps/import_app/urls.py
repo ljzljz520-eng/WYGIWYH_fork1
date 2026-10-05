@@ -48,6 +48,11 @@ urlpatterns = [
         name="import_run_delete",
     ),
     path(
+        "import/profiles/<int:profile_id>/runs/<int:run_id>/retry/",
+        views.import_run_retry,
+        name="import_run_retry",
+    ),
+    path(
         "import/profiles/<int:profile_id>/runs/add/",
         views.import_run_add,
         name="import_run_add",

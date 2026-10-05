@@ -1,8 +1,5 @@
-import shutil
-
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.core.files.storage import FileSystemStorage
 from django.http import HttpResponse
 from django.shortcuts import render, get_object_or_404
 from django.utils.translation import gettext_lazy as _
@@ -10,9 +7,9 @@ from django.views.decorators.http import require_http_methods
 
 from apps.common.decorators.htmx import only_htmx
 from apps.import_app.forms import ImportRunFileUploadForm, ImportProfileForm
-from apps.import_app.models import ImportRun, ImportProfile
+from apps.import_app.models import ImportRun, ImportProfile, ImportRow
 from apps.import_app.services import PresetService
-from apps.import_app.tasks import process_import
+from apps.import_app.services.enqueue import enqueue_import_run
 from apps.common.decorators.demo import disabled_on_demo
 
 
@@ -159,11 +156,28 @@ def import_runs_list(request, profile_id):
 @require_http_methods(["GET", "POST"])
 def import_run_log(request, profile_id, run_id):
     run = ImportRun.objects.get(profile__id=profile_id, id=run_id)
+    failed_rows = (
+        run.rows.filter(
+            status__in=[
+                ImportRow.Status.FAILED_RETRYABLE,
+                ImportRow.Status.FAILED_PERMANENT,
+            ]
+        )
+        .order_by("sequence")
+        .values(
+            "sequence",
+            "section",
+            "row_number",
+            "status",
+            "attempts",
+            "failure_reason",
+        )
+    )
 
     return render(
         request,
         "import_app/fragments/runs/log.html",
-        {"run": run},
+        {"run": run, "failed_rows": failed_rows},
     )
 
 
@@ -179,20 +193,23 @@ def import_run_add(request, profile_id):
 
         if form.is_valid():
             uploaded_file = request.FILES["file"]
-            fs = FileSystemStorage(location="/usr/src/app/temp")
-            filename = fs.save(uploaded_file.name, uploaded_file)
-            file_path = fs.path(filename)
 
-            import_run = ImportRun.objects.create(profile=profile, file_name=filename)
-
-            # Defer the procrastinate task
-            process_import.defer(
-                import_run_id=import_run.id,
-                file_path=file_path,
+            _import_run, created = enqueue_import_run(
+                profile=profile,
+                uploaded_file=uploaded_file,
                 user_id=request.user.id,
             )
 
-            messages.success(request, _("Import Run queued successfully"))
+            if created:
+                messages.success(request, _("Import Run queued successfully"))
+            else:
+                messages.info(
+                    request,
+                    _(
+                        "An identical file is already queued or being processed "
+                        "for this import profile."
+                    ),
+                )
 
             return HttpResponse(
                 status=204,
@@ -217,6 +234,7 @@ def import_run_add(request, profile_id):
 def import_run_delete(request, profile_id, run_id):
     run = ImportRun.objects.get(profile__id=profile_id, id=run_id)
 
+    _remove_run_file(run)
     run.delete()
 
     messages.success(request, _("Run deleted successfully"))
@@ -225,5 +243,46 @@ def import_run_delete(request, profile_id, run_id):
         status=204,
         headers={
             "HX-Trigger": "updated",
+        },
+    )
+
+
+def _remove_run_file(run: ImportRun) -> None:
+    """Best-effort removal of the run's staged source file."""
+    import os
+    import logging
+
+    path = run.stored_file_path
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Failed to delete staged file %s", path, exc_info=True
+        )
+
+
+@only_htmx
+@login_required
+@disabled_on_demo
+@require_http_methods(["POST"])
+def import_run_retry(request, profile_id, run_id):
+    from apps.import_app.services.retry import RetryNotAvailable, retry_import_run
+
+    run = get_object_or_404(ImportRun, profile__id=profile_id, id=run_id)
+
+    try:
+        retry_import_run(run, user_id=request.user.id)
+    except RetryNotAvailable as e:
+        messages.error(request, e.message)
+    else:
+        messages.success(request, _("Import Run queued for retry"))
+
+    return HttpResponse(
+        status=204,
+        headers={
+            "HX-Trigger": "updated, hide_offcanvas",
         },
     )
